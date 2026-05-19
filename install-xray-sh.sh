@@ -7,12 +7,12 @@ set -euo pipefail
 # 管理入口：xray
 # 支持：
 #   1) VLESS+TLS+Vision+TCP
-#   2) VLESS+Reality+uTLS+Vision
-#   3) VLESS+Reality+XHTTP
-#   4) VLESS+TLS+XHTTP
+#   2) VLESS+Reality+uTLS+Vision（推荐）
+#   3) VLESS+Reality+XHTTP（推荐）
+#   4) VLESS+TLS+XHTTP（需配合CDN使用）
 #   5) Shadowsocks 2022
-#   6) VLESS+TLS+WS
-#   7) VMess+TLS+WS
+#   6) VLESS+TLS+WS（需配合CDN使用）
+#   7) VMess+TLS+WS（需配合CDN使用）
 # =========================================================
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
@@ -299,12 +299,12 @@ install_xray() {
 select_protocols() {
     info "=== 选择要部署的协议 ==="
     echo "1) VLESS+TLS+Vision+TCP"
-    echo "2) VLESS+Reality+uTLS+Vision"
+    echo "2) VLESS+Reality+uTLS+Vision（推荐）"
     echo "3) VLESS+Reality+XHTTP"
-    echo "4) VLESS+TLS+XHTTP"
+    echo "4) VLESS+TLS+XHTTP（需配合CDN使用）"
     echo "5) Shadowsocks 2022"
-    echo "6) VLESS+TLS+WS"
-    echo "7) VMess+TLS+WS"
+    echo "6) VLESS+TLS+WS（需配合CDN使用）"
+    echo "7) VMess+TLS+WS（需配合CDN使用）"
     echo ""
     echo "请输入要部署的协议编号(多个用空格分隔，如: 1 2 4 6):"
     read -r protocol_input
