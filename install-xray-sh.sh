@@ -1125,6 +1125,7 @@ RELAY_URI_FILE="${CONFIG_DIR}/relay_uri.txt"
 SERVICE_NAME="xray"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_ASSET_DIR="/usr/local/share/xray"
+RELAY_CERT_DIR="${CONFIG_DIR}/certs/relay"
 
 url_encode() {
     local s="$1"
@@ -1186,6 +1187,15 @@ rand_uuid() {
 
 rand_short_id() {
     openssl rand -hex 8 2>/dev/null || echo "0123456789abcdef"
+}
+
+rand_pass() {
+    local bytes="${1:-16}"
+    openssl rand -base64 "$bytes" 2>/dev/null | tr -d '\n\r'
+}
+
+rand_path() {
+    echo "/$(openssl rand -hex 8 2>/dev/null || echo xhttp)"
 }
 
 url_decode() {
@@ -1348,14 +1358,23 @@ action_view_uri() {
 
     if [ -s "$RELAY_URI_FILE" ]; then
         echo ""
-        echo "=== 线路机 Reality ==="
-        local idx=1 uri name
-        while IFS= read -r uri; do
-            [ -z "$uri" ] && continue
-            name="${uri##*#}"
-            if [ -z "$name" ] || [ "$name" = "$uri" ]; then
-                name="relay-reality-${idx}"
+        echo "=== 线路机节点 ==="
+        local idx=1 line record_index name uri extra
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+
+            IFS=$'\t' read -r record_index name uri extra <<< "$line"
+            if [[ "$record_index" =~ ^[0-9]+$ ]] && [ -n "${name:-}" ] && [ -n "${uri:-}" ]; then
+                :
+            else
+                # 兼容旧版 relay_uri.txt：每行只有一个 URI。
+                uri="$line"
+                name="${uri##*#}"
+                if [ -z "$name" ] || [ "$name" = "$uri" ]; then
+                    name="relay-node-${idx}"
+                fi
             fi
+
             echo "【${name}】"
             echo "$uri"
             echo ""
@@ -1411,6 +1430,119 @@ generate_relay_keypair() {
     fi
 }
 
+ensure_relay_tls_cert() {
+    mkdir -p "$RELAY_CERT_DIR"
+
+    local default_domain="${TLS_DOMAIN:-www.bing.com}"
+    echo ""
+    read -r -p "请输入 TLS 域名/SNI(留空默认 ${default_domain}): " RELAY_TLS_DOMAIN
+    RELAY_TLS_DOMAIN="$(echo "${RELAY_TLS_DOMAIN:-$default_domain}" | tr -d '[:space:]')"
+
+    RELAY_TLS_CERT_FILE="${RELAY_CERT_DIR}/relay-${RELAY_INDEX}-fullchain.pem"
+    RELAY_TLS_KEY_FILE="${RELAY_CERT_DIR}/relay-${RELAY_INDEX}-privkey.pem"
+
+    echo ""
+    info "=== 配置新增入站 TLS 证书 ==="
+    echo "1) 自动生成独立自签证书（默认）"
+    if [ -f "${TLS_CERT_FILE:-}" ] && [ -f "${TLS_KEY_FILE:-}" ]; then
+        echo "2) 使用当前 Xray 主 TLS 证书"
+    else
+        echo "2) 使用当前 Xray 主 TLS 证书（当前不存在，将自动回退自签）"
+    fi
+    echo "3) 使用已有证书文件"
+    read -r -p "请输入选择(默认 1): " relay_cert_choice
+    relay_cert_choice="${relay_cert_choice:-1}"
+
+    case "$relay_cert_choice" in
+        2)
+            if [ -f "${TLS_CERT_FILE:-}" ] && [ -f "${TLS_KEY_FILE:-}" ]; then
+                cp "$TLS_CERT_FILE" "$RELAY_TLS_CERT_FILE"
+                cp "$TLS_KEY_FILE" "$RELAY_TLS_KEY_FILE"
+            else
+                warn "当前主 TLS 证书不存在，自动生成独立自签证书"
+                openssl req -x509 -newkey rsa:2048 -nodes \
+                    -keyout "$RELAY_TLS_KEY_FILE" \
+                    -out "$RELAY_TLS_CERT_FILE" \
+                    -days 3650 \
+                    -subj "/CN=${RELAY_TLS_DOMAIN}" >/dev/null 2>&1 || return 1
+            fi
+            ;;
+        3)
+            local input_cert input_key
+            read -r -p "请输入 fullchain.pem 路径: " input_cert
+            read -r -p "请输入 privkey.pem 路径: " input_key
+            if [ ! -f "$input_cert" ] || [ ! -f "$input_key" ]; then
+                err "证书或私钥文件不存在"
+                return 1
+            fi
+            cp "$input_cert" "$RELAY_TLS_CERT_FILE"
+            cp "$input_key" "$RELAY_TLS_KEY_FILE"
+            ;;
+        *)
+            openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout "$RELAY_TLS_KEY_FILE" \
+                -out "$RELAY_TLS_CERT_FILE" \
+                -days 3650 \
+                -subj "/CN=${RELAY_TLS_DOMAIN}" >/dev/null 2>&1 || return 1
+            ;;
+    esac
+
+    chmod 600 "$RELAY_TLS_KEY_FILE" 2>/dev/null || true
+    info "新增入站 TLS 证书已准备: $RELAY_TLS_CERT_FILE"
+}
+
+generate_relay_vless_enc() {
+    local bin enc_output auth_marker="ML-KEM-768"
+    local decryption encryption
+
+    bin=$(xray_cmd) || { err "未找到 xray，无法生成 VLESS ENC 参数"; return 1; }
+    info "正在为新增 VLESS+Reality+XHTTP+Vision 入站生成 ML-KEM-768 ENC 参数..."
+    enc_output=$("$bin" vlessenc 2>&1) || {
+        err "xray vlessenc 执行失败"
+        echo "$enc_output"
+        return 1
+    }
+
+    decryption=$(printf '%s\n' "$enc_output" | awk -v auth="$auth_marker" '
+        index($0, "Authentication:") && index($0, auth) { found=1; next }
+        found && index($0, "Authentication:") { exit }
+        found && index($0, "\"decryption\":") {
+            line=$0; gsub(/\r/, "", line)
+            sub(/^.*\"decryption\":[[:space:]]*\"/, "", line)
+            sub(/\".*$/, "", line)
+            print line; exit
+        }
+    ')
+    encryption=$(printf '%s\n' "$enc_output" | awk -v auth="$auth_marker" '
+        index($0, "Authentication:") && index($0, auth) { found=1; next }
+        found && index($0, "Authentication:") { exit }
+        found && index($0, "\"encryption\":") {
+            line=$0; gsub(/\r/, "", line)
+            sub(/^.*\"encryption\":[[:space:]]*\"/, "", line)
+            sub(/\".*$/, "", line)
+            print line; exit
+        }
+    ')
+
+    if [ -z "$decryption" ] || [ -z "$encryption" ]; then
+        decryption=$(printf '%s\n' "$enc_output" | grep -E '"decryption"[[:space:]]*:' | tail -n1 | sed -E 's/^.*"decryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+        encryption=$(printf '%s\n' "$enc_output" | grep -E '"encryption"[[:space:]]*:' | tail -n1 | sed -E 's/^.*"encryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+    fi
+
+    if [[ -z "$decryption" || -z "$encryption" || "$decryption" != mlkem768x25519plus.* || "$encryption" != mlkem768x25519plus.* ]]; then
+        err "新增入站 VLESS ENC 参数解析失败"
+        echo "$enc_output"
+        return 1
+    fi
+    if [[ ! "$encryption" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        err "新增入站 VLESS ENC encryption 包含非 URL-safe 字符"
+        return 1
+    fi
+
+    RELAY_ENC_DECRYPTION="$decryption"
+    RELAY_ENC_ENCRYPTION="$encryption"
+}
+
 create_relay_inbound() {
     echo ""
     echo "请输入节点名称(留空则默认协议名):"
@@ -1423,30 +1555,199 @@ create_relay_inbound() {
     fi
 
     RELAY_INDEX="$(get_next_outbound_index)"
-    RELAY_TAG="relay-reality-in-${RELAY_INDEX}"
     LANDING_TAG="landing-out-${RELAY_INDEX}"
 
     echo ""
-    info "=== 新增线路机 Reality 入站 ==="
-    RELAY_PORT=$(read_port_or_random "请输入 VLESS Reality 端口(留空随机 10000-60000): ")
-    RELAY_UUID=$(rand_uuid)
-
-    local default_sni="${REALITY_SNI:-www.microsoft.com}"
+    info "=== 选择新增线路机入站协议 ==="
+    echo "1) VLESS+TLS+Vision+TCP"
+    echo "2) VLESS+Reality+uTLS+Vision"
+    echo "3) VLESS+Reality+XHTTP+Vision [ENC]"
+    echo "4) VLESS+TLS+XHTTP"
+    echo "5) Shadowsocks 2022"
+    echo "6) VLESS+TLS+WS"
+    echo "7) VMess+TLS+WS"
     echo ""
-    read -r -p "请输入 Reality 的 SNI(留空默认 ${default_sni}): " RELAY_SNI
-    RELAY_SNI="$(echo "${RELAY_SNI:-$default_sni}" | tr -d '[:space:]')"
+    read -r -p "请输入要新增的入站协议编号(默认 2): " RELAY_PROTOCOL
+    RELAY_PROTOCOL="${RELAY_PROTOCOL:-2}"
 
     echo ""
     read -r -p "请输入节点连接 IP 或 DDNS 域名(留空默认自动获取): " RELAY_CUSTOM_IP
     RELAY_CUSTOM_IP="$(echo "$RELAY_CUSTOM_IP" | tr -d '[:space:]')"
 
-    info "生成 Reality 密钥对..."
-    generate_relay_keypair || return 1
-    allow_port "$RELAY_PORT" tcp
+    local default_sni="${REALITY_SNI:-www.microsoft.com}"
+    local enc_path relay_host uri_fragment
 
-    info "线路机 Reality 入站端口: $RELAY_PORT"
-    info "线路机 Reality UUID: $RELAY_UUID"
-    info "线路机 Reality SNI: $RELAY_SNI"
+    case "$RELAY_PROTOCOL" in
+        1)
+            RELAY_TAG="relay-vless-tls-vision-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VLESS+TLS+Vision+TCP 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            ensure_relay_tls_cert || return 1
+            RELAY_URI_NAME="relay-vless-tls-vision-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg cert "$RELAY_TLS_CERT_FILE" --arg key "$RELAY_TLS_KEY_FILE" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vless",
+                settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision",email:$tag}],decryption:"none"},
+                streamSettings:{network:"tcp",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        2)
+            RELAY_TAG="relay-reality-vision-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VLESS+Reality+uTLS+Vision 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            read -r -p "请输入 Reality 的 SNI(留空默认 ${default_sni}): " RELAY_SNI
+            RELAY_SNI="$(echo "${RELAY_SNI:-$default_sni}" | tr -d '[:space:]')"
+            generate_relay_keypair || return 1
+            RELAY_URI_NAME="relay-reality-vision-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg sni "$RELAY_SNI" --arg private_key "$RELAY_PRIVATE_KEY" --arg sid "$RELAY_SHORT_ID" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vless",
+                settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision",email:$tag}],decryption:"none"},
+                streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),target:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private_key,shortIds:[$sid]}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        3)
+            RELAY_TAG="relay-reality-xhttp-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VLESS+Reality+XHTTP+Vision [ENC] 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            read -r -p "请输入 Reality 的 SNI(留空默认 ${default_sni}): " RELAY_SNI
+            RELAY_SNI="$(echo "${RELAY_SNI:-$default_sni}" | tr -d '[:space:]')"
+            read -r -p "请输入 Reality XHTTP 路径(留空随机): " RELAY_XHTTP_PATH
+            RELAY_XHTTP_PATH="${RELAY_XHTTP_PATH:-$(rand_path)}"
+            [[ "$RELAY_XHTTP_PATH" != /* ]] && RELAY_XHTTP_PATH="/${RELAY_XHTTP_PATH}"
+            generate_relay_keypair || return 1
+            generate_relay_vless_enc || return 1
+            RELAY_URI_NAME="relay-reality-xhttp-vision-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg decryption "$RELAY_ENC_DECRYPTION" --arg path "$RELAY_XHTTP_PATH" \
+              --arg sni "$RELAY_SNI" --arg private_key "$RELAY_PRIVATE_KEY" --arg sid "$RELAY_SHORT_ID" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vless",
+                settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision",email:$tag}],decryption:$decryption},
+                streamSettings:{network:"xhttp",security:"reality",xhttpSettings:{path:$path,mode:"auto"},realitySettings:{show:false,dest:($sni+":443"),target:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private_key,shortIds:[$sid]}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        4)
+            RELAY_TAG="relay-vless-tls-xhttp-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VLESS+TLS+XHTTP 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            read -r -p "请输入 TLS XHTTP 路径(留空随机): " RELAY_XHTTP_PATH
+            RELAY_XHTTP_PATH="${RELAY_XHTTP_PATH:-$(rand_path)}"
+            [[ "$RELAY_XHTTP_PATH" != /* ]] && RELAY_XHTTP_PATH="/${RELAY_XHTTP_PATH}"
+            ensure_relay_tls_cert || return 1
+            RELAY_URI_NAME="relay-vless-tls-xhttp-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg cert "$RELAY_TLS_CERT_FILE" --arg key "$RELAY_TLS_KEY_FILE" --arg path "$RELAY_XHTTP_PATH" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vless",
+                settings:{clients:[{id:$uuid,email:$tag}],decryption:"none"},
+                streamSettings:{network:"xhttp",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]},xhttpSettings:{path:$path}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        5)
+            RELAY_TAG="relay-ss2022-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 Shadowsocks 2022 端口(留空随机 10000-60000): ")
+            RELAY_SS_METHOD="2022-blake3-aes-128-gcm"
+            RELAY_SS_PASSWORD=$(rand_pass 16)
+            RELAY_URI_NAME="relay-ss2022-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg method "$RELAY_SS_METHOD" --arg password "$RELAY_SS_PASSWORD" '{
+                tag:$tag, listen:"::", port:$port, protocol:"shadowsocks",
+                settings:{method:$method,password:$password,network:"tcp,udp"},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        6)
+            RELAY_TAG="relay-vless-tls-ws-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VLESS+TLS+WS 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            read -r -p "请输入 VLESS WS 路径(留空随机): " RELAY_WS_PATH
+            RELAY_WS_PATH="${RELAY_WS_PATH:-$(rand_path)}"
+            [[ "$RELAY_WS_PATH" != /* ]] && RELAY_WS_PATH="/${RELAY_WS_PATH}"
+            ensure_relay_tls_cert || return 1
+            RELAY_URI_NAME="relay-vless-tls-ws-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg cert "$RELAY_TLS_CERT_FILE" --arg key "$RELAY_TLS_KEY_FILE" --arg path "$RELAY_WS_PATH" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vless",
+                settings:{clients:[{id:$uuid,email:$tag}],decryption:"none"},
+                streamSettings:{network:"websocket",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]},wsSettings:{path:$path}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        7)
+            RELAY_TAG="relay-vmess-tls-ws-in-${RELAY_INDEX}"
+            RELAY_PORT=$(read_port_or_random "请输入 VMess+TLS+WS 端口(留空随机 10000-60000): ")
+            RELAY_UUID=$(rand_uuid)
+            read -r -p "请输入 VMess WS 路径(留空随机): " RELAY_WS_PATH
+            RELAY_WS_PATH="${RELAY_WS_PATH:-$(rand_path)}"
+            [[ "$RELAY_WS_PATH" != /* ]] && RELAY_WS_PATH="/${RELAY_WS_PATH}"
+            ensure_relay_tls_cert || return 1
+            RELAY_URI_NAME="relay-vmess-tls-ws-${RELAY_INDEX}${RELAY_SUFFIX}"
+            RELAY_INBOUND_JSON=$(jq -nc \
+              --arg tag "$RELAY_TAG" --argjson port "$RELAY_PORT" --arg uuid "$RELAY_UUID" \
+              --arg cert "$RELAY_TLS_CERT_FILE" --arg key "$RELAY_TLS_KEY_FILE" --arg path "$RELAY_WS_PATH" '{
+                tag:$tag, listen:"::", port:$port, protocol:"vmess",
+                settings:{clients:[{id:$uuid,alterId:0,email:$tag}]},
+                streamSettings:{network:"websocket",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]},wsSettings:{path:$path}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+              }')
+            ;;
+        *)
+            err "无效的新增入站协议编号: $RELAY_PROTOCOL"
+            return 1
+            ;;
+    esac
+
+    allow_port "$RELAY_PORT" tcp
+    [ "$RELAY_PROTOCOL" = "5" ] && allow_port "$RELAY_PORT" udp
+
+    if [ -n "${RELAY_CUSTOM_IP:-}" ]; then
+        relay_host="$RELAY_CUSTOM_IP"
+    else
+        relay_host=$(get_public_ip)
+    fi
+    uri_fragment=$(url_encode "$RELAY_URI_NAME")
+
+    case "$RELAY_PROTOCOL" in
+        1)
+            RELAY_URI="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=${RELAY_TLS_DOMAIN}&fp=chrome&allowInsecure=1#${uri_fragment}"
+            ;;
+        2)
+            RELAY_URI="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${RELAY_SNI}&fp=chrome&pbk=${RELAY_PUBLIC_KEY}&sid=${RELAY_SHORT_ID}&spx=%2F#${uri_fragment}"
+            ;;
+        3)
+            enc_path=$(url_encode "$RELAY_XHTTP_PATH")
+            RELAY_URI="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=${RELAY_ENC_ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${RELAY_PUBLIC_KEY}&sid=${RELAY_SHORT_ID}&type=xhttp&path=${enc_path}&mode=auto#${uri_fragment}"
+            ;;
+        4)
+            enc_path=$(url_encode "$RELAY_XHTTP_PATH")
+            RELAY_URI="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&security=tls&type=xhttp&host=${RELAY_TLS_DOMAIN}&path=${enc_path}&sni=${RELAY_TLS_DOMAIN}&fp=chrome&allowInsecure=1#${uri_fragment}"
+            ;;
+        5)
+            local ss_userinfo ss_b64
+            ss_userinfo="${RELAY_SS_METHOD}:${RELAY_SS_PASSWORD}"
+            ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
+            RELAY_URI="ss://${ss_b64}@${relay_host}:${RELAY_PORT}#${uri_fragment}"
+            ;;
+        6)
+            enc_path=$(url_encode "$RELAY_WS_PATH")
+            RELAY_URI="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&security=tls&type=ws&host=${RELAY_TLS_DOMAIN}&path=${enc_path}&sni=${RELAY_TLS_DOMAIN}&fp=chrome&allowInsecure=1#${uri_fragment}"
+            ;;
+        7)
+            RELAY_URI=$(make_vmess_uri "$RELAY_URI_NAME" "$relay_host" "$RELAY_PORT" "$RELAY_UUID" "$RELAY_TLS_DOMAIN" "$RELAY_WS_PATH" "1")
+            ;;
+    esac
+
+    info "新增线路机入站协议: $RELAY_URI_NAME"
+    info "新增线路机入站标签: $RELAY_TAG"
+    info "监听端口: $RELAY_PORT"
 }
 
 parse_ss_link() {
@@ -1532,7 +1833,7 @@ action_modify_outbound() {
     read_config || return 1
 
     echo ""
-    info "将新增一个独立的 Reality 入站、Shadowsocks 出站和路由"
+    info "将新增一个独立入站、Shadowsocks 出站和路由"
 
     echo ""
     read -r -p "是否保留原来的直连节点？(Y/n): " KEEP_DIRECT
@@ -1560,7 +1861,7 @@ action_modify_outbound() {
     cp "$CONFIG_PATH" "$backup"
 
     if [[ "$KEEP_DIRECT" =~ ^[Yy]$ ]]; then
-        info "保留原来的直连节点，准备新增一个线路机入站"
+        info "保留原来的直连节点，准备新增一个独立线路机入站"
         create_relay_inbound || return 1
 
         append_ss_landing_outbound "$LANDING_TAG" || {
@@ -1572,44 +1873,10 @@ action_modify_outbound() {
         jq \
           --arg relay_tag "$RELAY_TAG" \
           --arg landing_tag "$LANDING_TAG" \
-          --argjson relay_port "$RELAY_PORT" \
-          --arg relay_uuid "$RELAY_UUID" \
-          --arg relay_sni "$RELAY_SNI" \
-          --arg relay_private_key "$RELAY_PRIVATE_KEY" \
-          --arg relay_short_id "$RELAY_SHORT_ID" '
+          --argjson relay_inbound "$RELAY_INBOUND_JSON" '
           .inbounds = (
             [.inbounds[]? | select(.tag != $relay_tag)]
-            + [{
-                "tag": $relay_tag,
-                "listen": "::",
-                "port": $relay_port,
-                "protocol": "vless",
-                "settings": {
-                  "clients": [{
-                    "id": $relay_uuid,
-                    "flow": "xtls-rprx-vision",
-                    "email": $relay_tag
-                  }],
-                  "decryption": "none"
-                },
-                "streamSettings": {
-                  "network": "tcp",
-                  "security": "reality",
-                  "realitySettings": {
-                    "show": false,
-                    "dest": ($relay_sni + ":443"),
-                    "target": ($relay_sni + ":443"),
-                    "xver": 0,
-                    "serverNames": [$relay_sni],
-                    "privateKey": $relay_private_key,
-                    "shortIds": [$relay_short_id]
-                  }
-                },
-                "sniffing": {
-                  "enabled": true,
-                  "destOverride": ["http", "tls", "quic"]
-                }
-            }]
+            + [$relay_inbound]
           )
           | .routing = (.routing // {"domainStrategy":"AsIs","rules":[]})
           | .routing.rules = (
@@ -1653,21 +1920,15 @@ action_modify_outbound() {
         service_restart || warn "重启服务失败"
 
         if [[ "$KEEP_DIRECT" =~ ^[Yy]$ ]]; then
-            local relay_host relay_uri
-            if [ -n "${RELAY_CUSTOM_IP:-}" ]; then
-                relay_host="$RELAY_CUSTOM_IP"
-            else
-                relay_host=$(get_public_ip)
-            fi
+            echo "=============== 新增线路机节点 ==============="
+            echo "【${RELAY_URI_NAME}】"
+            echo "$RELAY_URI"
+            echo "================================================"
 
-            relay_uri="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${RELAY_SNI}&fp=chrome&pbk=${RELAY_PUBLIC_KEY}&sid=${RELAY_SHORT_ID}&spx=%2F#relay-reality-${RELAY_INDEX}${RELAY_SUFFIX}"
-
-            echo "=============== 新增线路机 Reality 链接 ==============="
-            echo "$relay_uri"
-            echo "======================================================="
-
-            echo "$relay_uri" >> "$RELAY_URI_FILE"
+            printf '%s\t%s\t%s\n' "$RELAY_INDEX" "$RELAY_URI_NAME" "$RELAY_URI" >> "$RELAY_URI_FILE"
             info "线路机链接已保存到: $RELAY_URI_FILE"
+            info "已保留原有直连节点"
+            info "新增入站 $RELAY_TAG 将通过 $LANDING_TAG 转发到落地机"
         else
             info "未保留原有直连节点"
             info "所有现有入站流量将转发到 landing-out"
@@ -1753,18 +2014,24 @@ action_delete_outbound() {
     IFS=$'\t' read -r tag proto outbound_name server port linked_inbounds \
         <<< "${outbound_rows[$((choice - 1))]}"
 
-    local relay_tag=""
+    local relay_index="" delete_inbounds_json="[]"
     if [[ "$tag" =~ ^landing-out-([0-9]+)$ ]]; then
-        relay_tag="relay-reality-in-${BASH_REMATCH[1]}"
+        relay_index="${BASH_REMATCH[1]}"
+        delete_inbounds_json=$(jq -c --arg delete_out "$tag" '
+          [
+            .routing.rules[]?
+            | select(.outboundTag? == $delete_out)
+            | (.inboundTag // [])[]?
+          ] | unique
+        ' "$CONFIG_PATH")
     fi
 
     echo ""
     warn "此操作将删除出站 $tag，并删除引用它的路由"
-    if [ -n "$relay_tag" ] \
-        && jq -e --arg relay_tag "$relay_tag" \
-            '.inbounds[]? | select(.tag == $relay_tag)' \
-            "$CONFIG_PATH" >/dev/null 2>&1; then
-        warn "同时会删除对应入站 $relay_tag"
+    if [ "$(jq 'length' <<< "$delete_inbounds_json")" -gt 0 ]; then
+        while IFS= read -r relay_tag; do
+            [ -n "$relay_tag" ] && warn "同时会删除对应新增入站 $relay_tag"
+        done < <(jq -r '.[]' <<< "$delete_inbounds_json")
     fi
 
     read -r -p "确认删除出站？(y/N): " confirm
@@ -1779,27 +2046,31 @@ action_delete_outbound() {
 
     jq \
       --arg delete_out "$tag" \
-      --arg delete_in "$relay_tag" '
-      def inbound_matches($delete_in):
-        if $delete_in == "" then false
-        elif (.inboundTag? | type) == "array" then
-          (.inboundTag | index($delete_in)) != null
-        else
-          .inboundTag? == $delete_in
-        end;
+      --argjson delete_ins "$delete_inbounds_json" '
+      def has_deleted_inbound($rule; $delete_ins):
+        [
+          ($rule.inboundTag // [])[]?
+          | . as $in_tag
+          | select(($delete_ins | index($in_tag)) != null)
+        ] | length > 0;
 
       .outbounds = [.outbounds[]? | select(.tag != $delete_out)]
-      | if $delete_in != "" then
-          .inbounds = [.inbounds[]? | select(.tag != $delete_in)]
+      | if ($delete_ins | length) > 0 then
+          .inbounds = [
+            .inbounds[]?
+            | . as $in
+            | select(($delete_ins | index($in.tag)) == null)
+          ]
         else
           .
         end
       | if .routing and .routing.rules then
           .routing.rules = [
             .routing.rules[]?
+            | . as $rule
             | select(
-                (.outboundTag? != $delete_out)
-                and (inbound_matches($delete_in) | not)
+                ($rule.outboundTag? != $delete_out)
+                and ((has_deleted_inbound($rule; $delete_ins)) | not)
               )
           ]
         else
@@ -1811,8 +2082,12 @@ action_delete_outbound() {
         info "配置校验通过，正在重启服务"
         service_restart || warn "重启服务失败"
 
-        if [[ "$tag" =~ ^landing-out-([0-9]+)$ ]] && [ -f "$RELAY_URI_FILE" ]; then
-            sed -i.bak "/#relay-reality-${BASH_REMATCH[1]}/d" "$RELAY_URI_FILE"
+        if [ -n "$relay_index" ] && [ -f "$RELAY_URI_FILE" ]; then
+            awk -F '\t' -v idx="$relay_index" '
+              NF >= 3 && $1 == idx { next }
+              NF < 3 && $0 ~ ("#relay-reality-" idx "($|-)") { next }
+              { print }
+            ' "$RELAY_URI_FILE" > "${RELAY_URI_FILE}.tmp" && mv "${RELAY_URI_FILE}.tmp" "$RELAY_URI_FILE"
         fi
 
         info "已删除出站: $tag"
