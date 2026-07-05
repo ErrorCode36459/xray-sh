@@ -1134,6 +1134,7 @@ CONFIG_DIR="/etc/xray"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 CACHE_FILE="${CONFIG_DIR}/.config_cache"
 URI_FILE="${CONFIG_DIR}/uris.txt"
+RELAY_URI_FILE="${CONFIG_DIR}/relay_uri.txt"
 SERVICE_NAME="xray"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_ASSET_DIR="/usr/local/share/xray"
@@ -1161,6 +1162,72 @@ xray_cmd() {
     fi
 }
 
+
+rand_port() {
+    shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000))
+}
+
+valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+read_port_or_random() {
+    local prompt="$1" input port
+    while true; do
+        read -r -p "$prompt" input
+        port="${input:-$(rand_port)}"
+        if valid_port "$port"; then
+            echo "$port"
+            return 0
+        fi
+        warn "端口必须是 1-65535 的数字，请重新输入"
+    done
+}
+
+rand_uuid() {
+    local bin=""
+    bin=$(xray_cmd 2>/dev/null || true)
+    if [ -n "$bin" ]; then
+        "$bin" uuid 2>/dev/null | head -n1
+    elif [ -f /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'
+    fi
+}
+
+rand_short_id() {
+    openssl rand -hex 8 2>/dev/null || echo "0123456789abcdef"
+}
+
+url_decode() {
+    local data="${1//+/ }"
+    printf '%b' "${data//%/\\x}"
+}
+
+b64_decode() {
+    local data="$1"
+    data="${data//-/+}"
+    data="${data//_/\/}"
+    case $((${#data} % 4)) in
+        2) data="${data}==" ;;
+        3) data="${data}=" ;;
+    esac
+    printf "%s" "$data" | base64 -d 2>/dev/null
+}
+
+allow_port() {
+    local port="$1" proto="${2:-tcp}"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --zone=public --add-port="${port}/${proto}" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
 check_xray_config() {
     local bin
     bin=$(xray_cmd) || return 1
@@ -1169,10 +1236,11 @@ check_xray_config() {
 }
 
 show_xray_config_error() {
+    local config_path="${1:-$CONFIG_PATH}"
     local bin
     bin=$(xray_cmd) || { err "未找到 xray 可执行文件"; return 1; }
-    XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$bin" run -test -config "$CONFIG_PATH" \
-        || XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$bin" test -config "$CONFIG_PATH" \
+    XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$bin" run -test -config "$config_path" \
+        || XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$bin" test -config "$config_path" \
         || true
 }
 
@@ -1292,6 +1360,23 @@ action_view_uri() {
     generate_uris || { err "生成协议链接失败"; return 1; }
     echo ""
     cat "$URI_FILE"
+
+    if [ -s "$RELAY_URI_FILE" ]; then
+        echo ""
+        echo "=== 线路机 Reality ==="
+        local idx=1 uri name
+        while IFS= read -r uri; do
+            [ -z "$uri" ] && continue
+            name="${uri##*#}"
+            if [ -z "$name" ] || [ "$name" = "$uri" ]; then
+                name="relay-reality-${idx}"
+            fi
+            echo "【${name}】"
+            echo "$uri"
+            echo ""
+            idx=$((idx + 1))
+        done < "$RELAY_URI_FILE"
+    fi
 }
 
 action_edit_config() {
@@ -1304,6 +1389,473 @@ action_edit_config() {
         warn "配置校验失败，服务未重启"
         show_xray_config_error
     fi
+}
+
+
+get_next_outbound_index() {
+    local max_index
+    max_index=$(jq -r '
+      [
+        (.outbounds[]?.tag // empty)
+        | select(test("^landing-out-[0-9]+$"))
+        | capture("landing-out-(?<n>[0-9]+)").n
+        | tonumber
+      ]
+      | if length == 0 then 0 else max end
+    ' "$CONFIG_PATH" 2>/dev/null || echo 0)
+    echo $((max_index + 1))
+}
+
+generate_relay_keypair() {
+    local bin key_output
+    bin=$(xray_cmd) || { err "未找到 xray，无法生成 Reality 密钥"; return 1; }
+    key_output=$("$bin" x25519 2>&1) || {
+        err "生成 Reality 密钥失败"
+        echo "$key_output"
+        return 1
+    }
+
+    RELAY_PRIVATE_KEY=$(echo "$key_output" | grep -Ei 'Private[[:space:]]*key|PrivateKey' | awk -F ':' '{print $NF}' | awk '{print $NF}' | tr -d '\r')
+    RELAY_PUBLIC_KEY=$(echo "$key_output" | grep -Ei 'Public[[:space:]]*key|PublicKey|Password' | awk -F ':' '{print $NF}' | awk '{print $NF}' | tail -n1 | tr -d '\r')
+    RELAY_SHORT_ID=$(rand_short_id)
+
+    if [ -z "${RELAY_PRIVATE_KEY:-}" ] || [ -z "${RELAY_PUBLIC_KEY:-}" ] || [ -z "${RELAY_SHORT_ID:-}" ]; then
+        err "Reality 密钥解析失败"
+        echo "$key_output"
+        return 1
+    fi
+}
+
+create_relay_inbound() {
+    echo ""
+    echo "请输入节点名称(留空则默认协议名):"
+    read -r RELAY_NODE_NAME
+
+    if [[ -n "$RELAY_NODE_NAME" ]]; then
+        RELAY_SUFFIX="-${RELAY_NODE_NAME}"
+    else
+        RELAY_SUFFIX=""
+    fi
+
+    RELAY_INDEX="$(get_next_outbound_index)"
+    RELAY_TAG="relay-reality-in-${RELAY_INDEX}"
+    LANDING_TAG="landing-out-${RELAY_INDEX}"
+
+    echo ""
+    info "=== 新增线路机 Reality 入站 ==="
+    RELAY_PORT=$(read_port_or_random "请输入 VLESS Reality 端口(留空随机 10000-60000): ")
+    RELAY_UUID=$(rand_uuid)
+
+    local default_sni="${REALITY_SNI:-www.microsoft.com}"
+    echo ""
+    read -r -p "请输入 Reality 的 SNI(留空默认 ${default_sni}): " RELAY_SNI
+    RELAY_SNI="$(echo "${RELAY_SNI:-$default_sni}" | tr -d '[:space:]')"
+
+    echo ""
+    read -r -p "请输入节点连接 IP 或 DDNS 域名(留空默认自动获取): " RELAY_CUSTOM_IP
+    RELAY_CUSTOM_IP="$(echo "$RELAY_CUSTOM_IP" | tr -d '[:space:]')"
+
+    info "生成 Reality 密钥对..."
+    generate_relay_keypair || return 1
+    allow_port "$RELAY_PORT" tcp
+
+    info "线路机 Reality 入站端口: $RELAY_PORT"
+    info "线路机 Reality UUID: $RELAY_UUID"
+    info "线路机 Reality SNI: $RELAY_SNI"
+}
+
+parse_ss_link() {
+    local link="$1"
+    local raw userinfo server_part decoded
+
+    raw="${link#ss://}"
+    raw="${raw%%#*}"
+    raw="${raw%%\?*}"
+
+    if [[ "$raw" == *@* ]]; then
+        userinfo="${raw%@*}"
+        server_part="${raw#*@}"
+
+        if [[ "$userinfo" == *%* ]]; then
+            decoded="$(url_decode "$userinfo")"
+        elif [[ "$userinfo" == *:* ]]; then
+            decoded="$userinfo"
+        else
+            decoded="$(b64_decode "$userinfo" 2>/dev/null || true)"
+        fi
+    else
+        decoded="$(b64_decode "$raw" 2>/dev/null || true)"
+        [[ "$decoded" == *@* ]] || return 1
+        userinfo="${decoded%@*}"
+        server_part="${decoded#*@}"
+        decoded="$userinfo"
+    fi
+
+    [[ "$decoded" == *:* ]] || return 1
+    LANDING_METHOD="${decoded%%:*}"
+    LANDING_PASSWORD="${decoded#*:}"
+
+    if [[ "$server_part" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+        LANDING_SERVER="${BASH_REMATCH[1]}"
+        LANDING_PORT="${BASH_REMATCH[2]}"
+    else
+        LANDING_SERVER="${server_part%:*}"
+        LANDING_PORT="${server_part##*:}"
+    fi
+
+    [ -n "$LANDING_METHOD" ] \
+        && [ -n "$LANDING_PASSWORD" ] \
+        && [ -n "$LANDING_SERVER" ] \
+        && valid_port "$LANDING_PORT"
+}
+
+append_ss_landing_outbound() {
+    local landing_tag="$1"
+    jq \
+      --arg server "$LANDING_SERVER" \
+      --argjson port "$LANDING_PORT" \
+      --arg method "$LANDING_METHOD" \
+      --arg password "$LANDING_PASSWORD" \
+      --arg landing_tag "$landing_tag" '
+      .outbounds = (
+        [.outbounds[]? | select(.tag != $landing_tag)]
+        + [{
+            "tag": $landing_tag,
+            "protocol": "shadowsocks",
+            "settings": {
+              "address": $server,
+              "port": $port,
+              "method": $method,
+              "password": $password
+            }
+        }]
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+}
+
+rollback_invalid_config() {
+    local backup="$1"
+    local invalid="${CONFIG_PATH}.invalid.$(date +%s)"
+    cp "$CONFIG_PATH" "$invalid" 2>/dev/null || true
+    cp "$backup" "$CONFIG_PATH"
+    err "配置校验失败，已自动恢复修改前的配置"
+    warn "无效配置已保留到: $invalid"
+    show_xray_config_error "$invalid"
+}
+
+action_modify_outbound() {
+    read_config || return 1
+
+    echo ""
+    info "将新增一个独立的 Reality 入站、Shadowsocks 出站和路由"
+
+    echo ""
+    read -r -p "是否保留原来的直连节点？(Y/n): " KEEP_DIRECT
+    KEEP_DIRECT="${KEEP_DIRECT:-Y}"
+
+    echo ""
+    read -r -p "请输入落地机 SS 链接: " LANDING_LINK
+
+    if [[ ! "$LANDING_LINK" =~ ^ss:// ]]; then
+        err "当前路由管理仅支持 ss:// 落地机链接"
+        return 1
+    fi
+
+    if ! parse_ss_link "$LANDING_LINK"; then
+        err "解析落地机 SS 链接失败"
+        return 1
+    fi
+
+    info "落地机地址: $LANDING_SERVER"
+    info "落地机端口: $LANDING_PORT"
+    info "加密方式: $LANDING_METHOD"
+
+    local backup
+    backup="${CONFIG_PATH}.bak.$(date +%s)"
+    cp "$CONFIG_PATH" "$backup"
+
+    if [[ "$KEEP_DIRECT" =~ ^[Yy]$ ]]; then
+        info "保留原来的直连节点，准备新增一个线路机入站"
+        create_relay_inbound || return 1
+
+        append_ss_landing_outbound "$LANDING_TAG" || {
+            cp "$backup" "$CONFIG_PATH"
+            err "添加 Shadowsocks 出站失败，已恢复配置"
+            return 1
+        }
+
+        jq \
+          --arg relay_tag "$RELAY_TAG" \
+          --arg landing_tag "$LANDING_TAG" \
+          --argjson relay_port "$RELAY_PORT" \
+          --arg relay_uuid "$RELAY_UUID" \
+          --arg relay_sni "$RELAY_SNI" \
+          --arg relay_private_key "$RELAY_PRIVATE_KEY" \
+          --arg relay_short_id "$RELAY_SHORT_ID" '
+          .inbounds = (
+            [.inbounds[]? | select(.tag != $relay_tag)]
+            + [{
+                "tag": $relay_tag,
+                "listen": "::",
+                "port": $relay_port,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [{
+                    "id": $relay_uuid,
+                    "flow": "xtls-rprx-vision",
+                    "email": $relay_tag
+                  }],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "dest": ($relay_sni + ":443"),
+                    "target": ($relay_sni + ":443"),
+                    "xver": 0,
+                    "serverNames": [$relay_sni],
+                    "privateKey": $relay_private_key,
+                    "shortIds": [$relay_short_id]
+                  }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": ["http", "tls", "quic"]
+                }
+            }]
+          )
+          | .routing = (.routing // {"domainStrategy":"AsIs","rules":[]})
+          | .routing.rules = (
+            [
+              .routing.rules[]?
+              | select(
+                  (((.inboundTag // []) | index($relay_tag)) == null)
+                  and (.outboundTag? != $landing_tag)
+                )
+            ]
+            + [{
+                "type": "field",
+                "inboundTag": [$relay_tag],
+                "outboundTag": $landing_tag
+            }]
+          )
+        ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    else
+        info "不保留原来的直连节点，所有现有入站将转发到 landing-out"
+
+        append_ss_landing_outbound "landing-out" || {
+            cp "$backup" "$CONFIG_PATH"
+            err "添加 Shadowsocks 出站失败，已恢复配置"
+            return 1
+        }
+
+        jq '
+          . as $root
+          | ($root.inbounds | map(.tag)) as $in_tags
+          | .routing = (.routing // {"domainStrategy":"AsIs","rules":[]})
+          | .routing.rules = [{
+              "type": "field",
+              "inboundTag": $in_tags,
+              "outboundTag": "landing-out"
+          }]
+        ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    fi
+
+    if check_xray_config; then
+        info "出站配置校验通过"
+        service_restart || warn "重启服务失败"
+
+        if [[ "$KEEP_DIRECT" =~ ^[Yy]$ ]]; then
+            local relay_host relay_uri
+            if [ -n "${RELAY_CUSTOM_IP:-}" ]; then
+                relay_host="$RELAY_CUSTOM_IP"
+            else
+                relay_host=$(get_public_ip)
+            fi
+
+            relay_uri="vless://${RELAY_UUID}@${relay_host}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${RELAY_SNI}&fp=chrome&pbk=${RELAY_PUBLIC_KEY}&sid=${RELAY_SHORT_ID}&spx=%2F#relay-reality-${RELAY_INDEX}${RELAY_SUFFIX}"
+
+            echo "=============== 新增线路机 Reality 链接 ==============="
+            echo "$relay_uri"
+            echo "======================================================="
+
+            echo "$relay_uri" >> "$RELAY_URI_FILE"
+            info "线路机链接已保存到: $RELAY_URI_FILE"
+        else
+            info "未保留原有直连节点"
+            info "所有现有入站流量将转发到 landing-out"
+        fi
+    else
+        rollback_invalid_config "$backup"
+        return 1
+    fi
+}
+
+action_delete_outbound() {
+    read_config || return 1
+
+    local outbound_rows=()
+    mapfile -t outbound_rows < <(
+        jq -r '
+          . as $root
+          | .outbounds[]? as $out
+          | select(($out.tag // "") != "")
+          | select(($out.tag | test("^(direct|block|dns)-out$")) | not)
+          | (
+              if $out.protocol == "shadowsocks" then "Shadowsocks 出站"
+              elif $out.protocol == "vless" then "VLESS 出站"
+              elif $out.protocol == "vmess" then "VMess 出站"
+              else (($out.protocol // "-") + " 出站")
+              end
+            ) as $outbound_name
+          | (
+              [
+                $root.routing.rules[]?
+                | select(.outboundTag? == $out.tag)
+                | .inboundTag?
+                | if type == "array" then .[] else . end
+              ]
+              | unique
+              | join(" / ")
+            ) as $linked_inbounds
+          | [
+              ($out.tag // "-"),
+              ($out.protocol // "-"),
+              $outbound_name,
+              ($out.settings.address // "-"),
+              (($out.settings.port // "-") | tostring),
+              (if $linked_inbounds == "" then "-" else $linked_inbounds end)
+            ]
+          | @tsv
+        ' "$CONFIG_PATH" 2>/dev/null
+    )
+
+    if [ "${#outbound_rows[@]}" -eq 0 ]; then
+        warn "当前未检测到可删除的出站"
+        return 0
+    fi
+
+    echo ""
+    info "当前可删除的出站:"
+
+    local i tag proto outbound_name server port linked_inbounds
+    for i in "${!outbound_rows[@]}"; do
+        IFS=$'\t' read -r tag proto outbound_name server port linked_inbounds <<< "${outbound_rows[$i]}"
+        [ "$linked_inbounds" = "-" ] && linked_inbounds="未绑定入站"
+        printf "%d) [%s] %s: %s %s:%s\n" \
+            "$((i + 1))" "$linked_inbounds" "$outbound_name" "$tag" "$server" "$port"
+    done
+    echo "0) 取消"
+    echo ""
+
+    local choice
+    read -r -p "请选择要删除的出站编号: " choice
+
+    if [ "$choice" = "0" ]; then
+        info "已取消删除"
+        return 0
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] \
+        || [ "$choice" -lt 1 ] \
+        || [ "$choice" -gt "${#outbound_rows[@]}" ]; then
+        warn "无效选项: $choice"
+        return 1
+    fi
+
+    IFS=$'\t' read -r tag proto outbound_name server port linked_inbounds \
+        <<< "${outbound_rows[$((choice - 1))]}"
+
+    local relay_tag=""
+    if [[ "$tag" =~ ^landing-out-([0-9]+)$ ]]; then
+        relay_tag="relay-reality-in-${BASH_REMATCH[1]}"
+    fi
+
+    echo ""
+    warn "此操作将删除出站 $tag，并删除引用它的路由"
+    if [ -n "$relay_tag" ] \
+        && jq -e --arg relay_tag "$relay_tag" \
+            '.inbounds[]? | select(.tag == $relay_tag)' \
+            "$CONFIG_PATH" >/dev/null 2>&1; then
+        warn "同时会删除对应入站 $relay_tag"
+    fi
+
+    read -r -p "确认删除出站？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "已取消删除"
+        return 0
+    fi
+
+    local backup
+    backup="${CONFIG_PATH}.bak.$(date +%s)"
+    cp "$CONFIG_PATH" "$backup"
+
+    jq \
+      --arg delete_out "$tag" \
+      --arg delete_in "$relay_tag" '
+      def inbound_matches($delete_in):
+        if $delete_in == "" then false
+        elif (.inboundTag? | type) == "array" then
+          (.inboundTag | index($delete_in)) != null
+        else
+          .inboundTag? == $delete_in
+        end;
+
+      .outbounds = [.outbounds[]? | select(.tag != $delete_out)]
+      | if $delete_in != "" then
+          .inbounds = [.inbounds[]? | select(.tag != $delete_in)]
+        else
+          .
+        end
+      | if .routing and .routing.rules then
+          .routing.rules = [
+            .routing.rules[]?
+            | select(
+                (.outboundTag? != $delete_out)
+                and (inbound_matches($delete_in) | not)
+              )
+          ]
+        else
+          .
+        end
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    if check_xray_config; then
+        info "配置校验通过，正在重启服务"
+        service_restart || warn "重启服务失败"
+
+        if [[ "$tag" =~ ^landing-out-([0-9]+)$ ]] && [ -f "$RELAY_URI_FILE" ]; then
+            sed -i.bak "/#relay-reality-${BASH_REMATCH[1]}/d" "$RELAY_URI_FILE"
+        fi
+
+        info "已删除出站: $tag"
+    else
+        rollback_invalid_config "$backup"
+        return 1
+    fi
+}
+
+action_route_manage() {
+    while true; do
+        echo ""
+        echo "=========================="
+        echo " 路由管理"
+        echo "=========================="
+        echo "1) 添加出站"
+        echo "2) 删除出站"
+        echo "0) 返回上一级"
+        echo "=========================="
+        read -r -p "请输入选项: " route_opt
+
+        case "$route_opt" in
+            1) action_modify_outbound ;;
+            2) action_delete_outbound ;;
+            0) return 0 ;;
+            *) warn "无效选项: $route_opt" ;;
+        esac
+    done
 }
 
 action_update() {
@@ -1347,7 +1899,8 @@ show_menu() {
     echo "6) 查看 Xray 日志"
     echo "7) 校验配置文件"
     echo "8) 更新 Xray-core"
-    echo "9) 卸载"
+    echo "9) 路由管理"
+    echo "10) 卸载"
     echo "0) 退出"
     echo "=========================="
 }
@@ -1364,7 +1917,8 @@ while true; do
         6) [ "$OS" = "alpine" ] && tail -n 80 /var/log/xray.log || journalctl -u xray -n 80 --no-pager; read -r -p "按回车继续..." _ ;;
         7) check_xray_config && info "配置校验通过" || show_xray_config_error; read -r -p "按回车继续..." _ ;;
         8) action_update; read -r -p "按回车继续..." _ ;;
-        9) action_uninstall; exit 0 ;;
+        9) action_route_manage; read -r -p "按回车继续..." _ ;;
+        10) action_uninstall; exit 0 ;;
         0) exit 0 ;;
         *) warn "无效选项"; sleep 1 ;;
     esac
