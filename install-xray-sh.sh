@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # =========================================================
-# Xray 多协议一键部署脚本 v9
+# Xray 多协议一键部署脚本 v10
 # 目录：/etc/xray/config.json
 # 管理入口：xray
 # 支持：
 #   1) VLESS+TLS+Vision+TCP
-#   2) VLESS+Reality+uTLS+Vision（推荐）
-#   3) VLESS+Reality+XHTTP（推荐）
-#   4) VLESS+TLS+XHTTP（需配合CDN使用）
+#   2) VLESS+Reality+uTLS+Vision
+#   3) VLESS+Reality+XHTTP（自动启用 VLESS ENC）
+#   4) VLESS+TLS+XHTTP
 #   5) Shadowsocks 2022
-#   6) VLESS+TLS+WS（需配合CDN使用）
-#   7) VMess+TLS+WS（需配合CDN使用）
+#   6) VLESS+TLS+WS
+#   7) VMess+TLS+WS
 # =========================================================
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
@@ -68,7 +68,7 @@ show_banner() {
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         err "此脚本需要 root 权限"
-        err "请使用 root 用户执行：sudo bash install-xray-sh-v9.sh"
+        err "请使用 root 用户执行：sudo bash install-xray-sh-v10.sh"
         exit 1
     fi
 }
@@ -299,12 +299,12 @@ install_xray() {
 select_protocols() {
     info "=== 选择要部署的协议 ==="
     echo "1) VLESS+TLS+Vision+TCP"
-    echo "2) VLESS+Reality+uTLS+Vision（推荐）"
-    echo "3) VLESS+Reality+XHTTP"
-    echo "4) VLESS+TLS+XHTTP（需配合CDN使用）"
+    echo "2) VLESS+Reality+uTLS+Vision"
+    echo "3) VLESS+Reality+XHTTP [ENC]"
+    echo "4) VLESS+TLS+XHTTP"
     echo "5) Shadowsocks 2022"
-    echo "6) VLESS+TLS+WS（需配合CDN使用）"
-    echo "7) VMess+TLS+WS（需配合CDN使用）"
+    echo "6) VLESS+TLS+WS"
+    echo "7) VMess+TLS+WS"
     echo ""
     echo "请输入要部署的协议编号(多个用空格分隔，如: 1 2 4 6):"
     read -r protocol_input
@@ -349,7 +349,7 @@ EOF
     info "已选择协议:"
     if [[ "$ENABLE_VLESS_TLS_VISION" == "true" ]]; then echo "  - VLESS+TLS+Vision+TCP"; fi
     if [[ "$ENABLE_VLESS_REALITY_VISION" == "true" ]]; then echo "  - VLESS+Reality+uTLS+Vision"; fi
-    if [[ "$ENABLE_VLESS_REALITY_XHTTP" == "true" ]]; then echo "  - VLESS+Reality+XHTTP"; fi
+    if [[ "$ENABLE_VLESS_REALITY_XHTTP" == "true" ]]; then echo "  - VLESS+Reality+XHTTP（启用 ENC）"; fi
     if [[ "$ENABLE_VLESS_TLS_XHTTP" == "true" ]]; then echo "  - VLESS+TLS+XHTTP"; fi
     if [[ "$ENABLE_SS2022" == "true" ]]; then echo "  - Shadowsocks 2022"; fi
     if [[ "$ENABLE_VLESS_TLS_WS" == "true" ]]; then echo "  - VLESS+TLS+WS"; fi
@@ -492,6 +492,103 @@ generate_reality_keys() {
     info "Reality 密钥已生成"
 }
 
+
+# 为 3) VLESS+Reality+XHTTP 生成 VLESS Encryption (ENC) 参数。
+# 服务端使用 settings.decryption，客户端分享链接使用 encryption 参数。
+generate_vless_enc() {
+    if [ "${ENABLE_VLESS_REALITY_XHTTP:-false}" != "true" ]; then
+        return 0
+    fi
+
+    local bin enc_output auth_choice auth_marker
+    local decryption encryption
+
+    bin=$(xray_cmd) || { err "未找到 xray，无法生成 VLESS ENC 参数"; exit 1; }
+
+    echo ""
+    info "=== 配置 VLESS Encryption (ENC) ==="
+    echo "1) X25519（默认，ENC 参数较短）"
+    echo "2) ML-KEM-768（抗量子认证，ENC 参数较长）"
+    read -r -p "请输入选择(默认 1): " auth_choice
+    auth_choice="${auth_choice:-1}"
+
+    case "$auth_choice" in
+        1)
+            VLESS_ENC_AUTH="x25519"
+            auth_marker="X25519"
+            ;;
+        2)
+            VLESS_ENC_AUTH="mlkem768"
+            auth_marker="ML-KEM-768"
+            ;;
+        *)
+            warn "无效选择，使用默认 X25519"
+            VLESS_ENC_AUTH="x25519"
+            auth_marker="X25519"
+            ;;
+    esac
+
+    info "正在调用 Xray-core vlessenc 生成 ENC 参数..."
+    enc_output=$("$bin" vlessenc 2>&1) || {
+        err "xray vlessenc 执行失败"
+        echo "$enc_output"
+        exit 1
+    }
+
+    # 按 Authentication 分段解析，避免把 X25519 与 ML-KEM-768 参数混用。
+    decryption=$(printf '%s\n' "$enc_output" | awk -v auth="$auth_marker" '
+        index($0, "Authentication:") && index($0, auth) { found=1; next }
+        found && index($0, "Authentication:") { exit }
+        found && index($0, "\"decryption\":") {
+            line=$0
+            gsub(/\r/, "", line)
+            sub(/^.*\"decryption\":[[:space:]]*\"/, "", line)
+            sub(/\".*$/, "", line)
+            print line
+            exit
+        }
+    ')
+
+    encryption=$(printf '%s\n' "$enc_output" | awk -v auth="$auth_marker" '
+        index($0, "Authentication:") && index($0, auth) { found=1; next }
+        found && index($0, "Authentication:") { exit }
+        found && index($0, "\"encryption\":") {
+            line=$0
+            gsub(/\r/, "", line)
+            sub(/^.*\"encryption\":[[:space:]]*\"/, "", line)
+            sub(/\".*$/, "", line)
+            print line
+            exit
+        }
+    ')
+
+    # 兼容 Xray 输出格式的小幅变化：X25519 取第一组，ML-KEM-768 取最后一组。
+    if [ -z "$decryption" ] || [ -z "$encryption" ]; then
+        if [ "$VLESS_ENC_AUTH" = "mlkem768" ]; then
+            decryption=$(printf '%s\n' "$enc_output" | grep -E '"decryption"[[:space:]]*:' | tail -n1 | sed -E 's/^.*"decryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+            encryption=$(printf '%s\n' "$enc_output" | grep -E '"encryption"[[:space:]]*:' | tail -n1 | sed -E 's/^.*"encryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+        else
+            decryption=$(printf '%s\n' "$enc_output" | grep -E '"decryption"[[:space:]]*:' | head -n1 | sed -E 's/^.*"decryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+            encryption=$(printf '%s\n' "$enc_output" | grep -E '"encryption"[[:space:]]*:' | head -n1 | sed -E 's/^.*"encryption"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/' || true)
+        fi
+    fi
+
+    if [[ -z "$decryption" || -z "$encryption" || "$decryption" != mlkem768x25519plus.* || "$encryption" != mlkem768x25519plus.* ]]; then
+        err "VLESS ENC 参数解析失败，Xray 原始输出如下："
+        echo "$enc_output"
+        exit 1
+    fi
+
+    VLESS_ENC_DECRYPTION="$decryption"
+    VLESS_ENC_ENCRYPTION="$encryption"
+
+    printf '%s' "$VLESS_ENC_DECRYPTION" > "${CONFIG_DIR}/.vless_enc_decryption"
+    printf '%s' "$VLESS_ENC_ENCRYPTION" > "${CONFIG_DIR}/.vless_enc_encryption"
+    chmod 600 "${CONFIG_DIR}/.vless_enc_decryption" "${CONFIG_DIR}/.vless_enc_encryption" 2>/dev/null || true
+
+    info "VLESS ENC 参数已生成，认证方式: $VLESS_ENC_AUTH"
+}
+
 get_config() {
     info "开始配置端口、UUID 和密码..."
 
@@ -621,6 +718,7 @@ append_inbound_vless_reality_xhttp() {
       --argjson arr "$inbounds" \
       --argjson port "$PORT_VLESS_REALITY_XHTTP" \
       --arg uuid "$UUID_VLESS_REALITY_XHTTP" \
+      --arg decryption "$VLESS_ENC_DECRYPTION" \
       --arg sni "$REALITY_SNI" \
       --arg private_key "$REALITY_PRIVATE_KEY" \
       --arg sid "$REALITY_XHTTP_SID" \
@@ -631,8 +729,8 @@ append_inbound_vless_reality_xhttp() {
         "port": $port,
         "protocol": "vless",
         "settings": {
-          "clients": [{"id": $uuid, "email": "vless-reality-xhttp"}],
-          "decryption": "none"
+          "clients": [{"id": $uuid, "email": "vless-reality-xhttp-enc"}],
+          "decryption": $decryption
         },
         "streamSettings": {
           "network": "xhttp",
@@ -812,6 +910,9 @@ XHTTP_PATH=$XHTTP_PATH
 REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_XHTTP_SID=$REALITY_XHTTP_SID
+VLESS_ENC_AUTH=$VLESS_ENC_AUTH
+VLESS_ENC_DECRYPTION=$VLESS_ENC_DECRYPTION
+VLESS_ENC_ENCRYPTION=$VLESS_ENC_ENCRYPTION
 EOF
     $ENABLE_VLESS_TLS_XHTTP && cat >> "$CACHE_FILE" <<EOF
 PORT_VLESS_TLS_XHTTP=$PORT_VLESS_TLS_XHTTP
@@ -973,9 +1074,12 @@ generate_uris() {
     fi
 
     if $ENABLE_VLESS_REALITY_XHTTP; then
+        [ -n "${VLESS_ENC_ENCRYPTION:-}" ] || { err "VLESS ENC encryption 参数为空"; return 1; }
         enc_path=$(url_encode "$XHTTP_PATH")
         echo "=== VLESS+Reality+XHTTP ===" >> "$URI_FILE"
-        echo "vless://${UUID_VLESS_REALITY_XHTTP}@${host}:${PORT_VLESS_REALITY_XHTTP}?encryption=none&security=reality&type=xhttp&path=${enc_path}&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_XHTTP_SID}#reality-xhttp${suffix}" >> "$URI_FILE"
+        local enc_value
+        enc_value=$(url_encode "$VLESS_ENC_ENCRYPTION")
+        echo "vless://${UUID_VLESS_REALITY_XHTTP}@${host}:${PORT_VLESS_REALITY_XHTTP}?encryption=${enc_value}&security=reality&type=xhttp&path=${enc_path}&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_XHTTP_SID}#reality-xhttp${suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
 
@@ -1124,6 +1228,8 @@ read_config() {
     CUSTOM_IP="${CUSTOM_IP:-}"
     TLS_DOMAIN="${TLS_DOMAIN:-www.bing.com}"
     REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
+    VLESS_ENC_AUTH="${VLESS_ENC_AUTH:-x25519}"
+    VLESS_ENC_ENCRYPTION="${VLESS_ENC_ENCRYPTION:-}"
     suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
 }
 
@@ -1145,9 +1251,15 @@ generate_uris() {
         echo "" >> "$URI_FILE"
     fi
     if [ "$ENABLE_VLESS_REALITY_XHTTP" = "true" ]; then
+        if [ -z "${VLESS_ENC_ENCRYPTION:-}" ]; then
+            err "未找到 VLESS ENC 客户端 encryption 参数，请重新运行安装脚本生成"
+            return 1
+        fi
         enc_path=$(url_encode "$XHTTP_PATH")
         echo "=== VLESS+Reality+XHTTP ===" >> "$URI_FILE"
-        echo "vless://${UUID_VLESS_REALITY_XHTTP}@${host}:${PORT_VLESS_REALITY_XHTTP}?encryption=none&security=reality&type=xhttp&path=${enc_path}&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_XHTTP_SID}#reality-xhttp${suffix}" >> "$URI_FILE"
+        local enc_value
+        enc_value=$(url_encode "$VLESS_ENC_ENCRYPTION")
+        echo "vless://${UUID_VLESS_REALITY_XHTTP}@${host}:${PORT_VLESS_REALITY_XHTTP}?encryption=${enc_value}&security=reality&type=xhttp&path=${enc_path}&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_XHTTP_SID}#reality-xhttp${suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
     if [ "$ENABLE_VLESS_TLS_XHTTP" = "true" ]; then
@@ -1281,6 +1393,7 @@ main() {
     info "进入证书和 Reality 密钥准备..."
     generate_tls_cert
     generate_reality_keys
+    generate_vless_enc
     info "进入协议端口与账号配置..."
     get_config
     info "进入 Xray 配置生成与校验..."
@@ -1309,6 +1422,7 @@ main() {
     echo "   缓存: $CACHE_FILE"
     need_tls && echo "   证书: $TLS_CERT_FILE / $TLS_KEY_FILE"
     echo "   管理面板: $PANEL_PATH"
+    $ENABLE_VLESS_REALITY_XHTTP && echo "   VLESS ENC: 已启用 (${VLESS_ENC_AUTH})"
     echo ""
     info "📜 客户端链接:"
     sed 's/^/   /' "$URI_FILE"
